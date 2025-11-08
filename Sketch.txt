@@ -1,0 +1,426 @@
+/**
+ * Mikrotik Router Status Display for ESP32 and 3.5" TFT (480x320)
+ *
+ * - 64-bit safe, dynamic‐scaled graph (clamped to 480 Mbps)
+ * - Anti-aliased VLW fonts for all text
+ * - LittleFS for font storage (fonts/ subfolder)
+ */
+
+#include <LittleFS.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <map>
+#include <time.h>
+#include <stdlib.h>   // atoll()
+
+// FONT FILES ON LittleFS (in fonts/ subfolder, no extension)
+#define SMALL_FONT "fonts/NSBold15"
+#define LARGE_FONT "fonts/NSBold36"
+
+// TFT instance
+TFT_eSPI tft = TFT_eSPI();
+
+// Screen size
+static const int SCREEN_WIDTH  = 480;
+static const int SCREEN_HEIGHT = 320;
+
+// Graph history
+#define HISTORY_SIZE 40
+
+// Wi-Fi & Router API
+const char* wifi_ssid       = "ORBI62";
+const char* wifi_password   = "myleetkey";
+const char* router_address  = "http://192.168.1.1";
+const char* router_login    = "APIUser";
+const char* router_password = "myleetkey";
+
+// Which interface to graph (ether1 → *2 → id 2)
+const int graph_interface_id = 2;
+
+// Per-interface data
+typedef struct {
+  uint64_t rx;
+  uint64_t tx;
+  uint64_t time;
+  int      pos;
+  uint64_t hist_rx[HISTORY_SIZE];
+  uint64_t hist_tx[HISTORY_SIZE];
+} mt_data_t;
+
+// Router system info
+typedef struct {
+  uint32_t uptime;
+  uint32_t memoryFree;
+  uint32_t memoryTotal;
+  float    cpuLoad;
+} router_info_t;
+
+std::map<int, mt_data_t*> ifaces;
+router_info_t routerInfo = {0, 0, 0, 0.0f};
+
+// Convert "*2" → 2
+int id2int(const char* s) {
+  return strtol(s + 1, nullptr, 16);
+}
+
+// Parse "1w2d3h4m5s" → seconds
+uint32_t parseUptimeToSeconds(const String& s) {
+  String str = s; str.trim();
+  uint32_t total = 0;
+  int pos = 0;
+  while (pos < str.length()) {
+    int alpha = -1;
+    for (int i = pos; i < str.length(); i++) {
+      if (isalpha(str[i])) { alpha = i; break; }
+    }
+    if (alpha < 0) break;
+    uint32_t n = str.substring(pos, alpha).toInt();
+    switch (str[alpha]) {
+      case 'w': total += n * 7 * 24 * 3600; break;
+      case 'd': total += n * 24 * 3600;       break;
+      case 'h': total += n * 3600;            break;
+      case 'm': total += n * 60;              break;
+      case 's': total += n;                   break;
+    }
+    pos = alpha + 1;
+  }
+  return total;
+}
+
+// Parse "512MiB"/"2048KiB" → bytes
+uint32_t parseMemoryToBytes(const String& s) {
+  String str = s; str.trim();
+  if (str.endsWith("MiB")) return (uint32_t)(str.toFloat() * 1024.0 * 1024.0);
+  if (str.endsWith("KiB")) return (uint32_t)(str.toFloat() * 1024.0);
+  return (uint32_t)str.toInt();
+}
+
+// Format seconds → "Xd Yh Zm"
+void formatUptime(uint32_t sec, char* buf, size_t len) {
+  if (sec == 0) {
+    strncpy(buf, "N/A", len);
+    buf[len-1] = '\0';
+    return;
+  }
+  uint32_t d = sec / 86400; sec %= 86400;
+  uint32_t h = sec / 3600;  sec %= 3600;
+  uint32_t m = sec / 60;
+  snprintf(buf, len, "%ud %uh %um", d, h, m);
+}
+
+// Fetch system info from Mikrotik REST API
+void fetchRouterInfo() {
+  String url = String(router_address) + "/rest/system/resource/print";
+  HTTPClient http;
+  http.begin(url);
+  http.setAuthorization(router_login, router_password);
+
+  StaticJsonDocument<128> q;
+  auto arr = q[".proplist"].to<JsonArray>();
+  arr.add("uptime");
+  arr.add("cpu-load");
+  arr.add("free-memory");
+  arr.add("total-memory");
+  String body; serializeJson(q, body);
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  if (code == 200) {
+    String resp = http.getString();
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, resp) == DeserializationError::Ok &&
+        doc.is<JsonArray>()) {
+      auto o = doc[0].as<JsonObject>();
+      routerInfo.uptime      = parseUptimeToSeconds(o["uptime"]   | "0s");
+      routerInfo.cpuLoad     = String(o["cpu-load"]   | "0%").toFloat();
+      routerInfo.memoryFree  = parseMemoryToBytes(o["free-memory"]  | "0");
+      routerInfo.memoryTotal = parseMemoryToBytes(o["total-memory"] | "0");
+    }
+  }
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Mount LittleFS before loading fonts
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS Mount Failed! Formatting...");
+    LittleFS.format();
+    if (!LittleFS.begin()) {
+      Serial.println("LittleFS initialization failed after format!");
+      while (true) delay(100);
+    }
+    Serial.println("LittleFS formatted and mounted successfully");
+  }
+
+  // DEBUG: List all files
+  Serial.println("\nFiles in LittleFS:");
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    Serial.print("  ");
+    Serial.println(file.name());
+    file = root.openNextFile();
+  }
+  root.close();
+  delay(500);  // Give filesystem time to settle
+
+  // TFT init and clear
+#ifdef TFT_BL
+  pinMode(TFT_BL, OUTPUT);
+  analogWrite(TFT_BL, 100);
+#endif
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  // Wi-Fi connect message (built-in font)
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawCentreString("Connecting to WiFi...", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 10, 1);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print('.');
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED);
+    tft.setTextSize(2);
+    tft.drawCentreString("WiFi Failed", SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 1);
+    while (true) delay(100);
+  }
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+// Helper function to clear specific areas
+void clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  tft.fillRect(x, y, w, h, TFT_BLACK);
+}
+
+void loop() {
+  // Reconnect if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(2000);
+    return;
+  }
+
+  // Poll interface stats
+  String url = String(router_address) + "/rest/interface/ethernet/print";
+  String q   = "{\".proplist\": \".id,name,rx-bytes,tx-bytes,running\"}";
+  HTTPClient http;
+  http.begin(url);
+  http.setAuthorization(router_login, router_password);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(q);
+  if (code < 200 || code >= 300) {
+    http.end();
+    delay(1000);
+    return;
+  }
+  String resp = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, resp) != DeserializationError::Ok) {
+    delay(1000);
+    return;
+  }
+
+  uint64_t nowMs = millis();
+  if (doc.is<JsonArray>()) {
+    for (auto item : doc.as<JsonArray>()) {
+      const char* sid = item[".id"] | "";
+      if (!sid[0]) continue;
+      int id = id2int(sid);
+
+      uint64_t rx = (uint64_t)atoll(item["rx-bytes"] | "0");
+      uint64_t tx = (uint64_t)atoll(item["tx-bytes"] | "0");
+
+      mt_data_t* iface;
+      if (!ifaces.count(id)) {
+        iface = (mt_data_t*)malloc(sizeof(mt_data_t));
+        memset(iface, 0, sizeof(mt_data_t));
+        iface->rx = rx;
+        iface->tx = tx;
+        iface->time = nowMs;
+        ifaces[id] = iface;
+      } else {
+        iface = ifaces[id];
+        double dt = (nowMs - iface->time) / 1000.0;
+        if (iface->time > 0 && dt >= 0.1) {
+          uint64_t drx = (rx > iface->rx) ? rx - iface->rx : 0;
+          uint64_t dtx = (tx > iface->tx) ? tx - iface->tx : 0;
+          iface->hist_rx[iface->pos] = (uint64_t)(drx / dt);
+          iface->hist_tx[iface->pos] = (uint64_t)(dtx / dt);
+          if (++iface->pos >= HISTORY_SIZE) iface->pos = 0;
+        }
+        iface->rx = rx;
+        iface->tx = tx;
+        iface->time = nowMs;
+      }
+    }
+  }
+
+  // Get system info
+  fetchRouterInfo();
+
+  // ===== DRAW (Selective Updates) =====
+  // Only clear areas that will change
+
+  // Top info bar - clear and redraw
+  {
+    clearArea(0, 0, SCREEN_WIDTH, 70);
+    
+    time_t now = time(nullptr);
+    struct tm* tmInfo = localtime(&now);
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%d-%m-%Y %I:%M %p", tmInfo);
+
+    char upBuf[32];
+    formatUptime(routerInfo.uptime, upBuf, sizeof(upBuf));
+    uint32_t usedMB  = (routerInfo.memoryTotal - routerInfo.memoryFree) / 1024 / 1024;
+    uint32_t totalMB = routerInfo.memoryTotal / 1024 / 1024;
+    char sysBuf[128];
+    snprintf(sysBuf, sizeof(sysBuf),
+             "CPU: %.0f%% | RAM: %u/%u MB | Up: %s",
+             routerInfo.cpuLoad, usedMB, totalMB, upBuf);
+
+    tft.setTextColor(TFT_YELLOW);
+    tft.loadFont(SMALL_FONT, LittleFS);
+    tft.drawString(timeBuf,    10,  8, 0);
+    tft.drawString(sysBuf,    10, 30, 0);
+    tft.unloadFont();
+  }
+
+  // Current TX/RX line - clear and redraw
+  {
+    clearArea(0, 65, SCREEN_WIDTH, 20);
+    
+    if (ifaces.count(graph_interface_id)) {
+      mt_data_t* iface = ifaces[graph_interface_id];
+      int lastIdx = (iface->pos == 0) ? HISTORY_SIZE - 1 : iface->pos - 1;
+      double rx_mbps = iface->hist_rx[lastIdx] * 8.0 / 1024.0 / 1024.0;
+      double tx_mbps = iface->hist_tx[lastIdx] * 8.0 / 1024.0 / 1024.0;
+      char buf[64];
+      snprintf(buf, sizeof(buf), "TX: %.2f Mbps | RX: %.2f Mbps", tx_mbps, rx_mbps);
+
+      tft.setTextColor(TFT_WHITE);
+      tft.loadFont(SMALL_FONT, LittleFS);
+      tft.drawCentreString(buf, SCREEN_WIDTH/2, 70, 0);
+      tft.unloadFont();
+    }
+  }
+
+  // Graph + bars + labels + legend
+  if (ifaces.count(graph_interface_id)) {
+    mt_data_t* iface = ifaces[graph_interface_id];
+    const int graph_left   =  60;
+    const int graph_top    =  85;
+    const int graph_width  = SCREEN_WIDTH - graph_left - 15;
+    const int graph_height = SCREEN_HEIGHT - graph_top - 35;
+
+    // Clear entire graph area including axes and labels (starting below legend)
+    clearArea(0, graph_top, graph_left + graph_width + 20, graph_height + 30);
+
+    // dynamic peak
+    uint64_t dyn_max = 1;
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+      uint64_t b_rx = iface->hist_rx[i] * 8;
+      uint64_t b_tx = iface->hist_tx[i] * 8;
+      dyn_max = max(dyn_max, max(b_rx, b_tx));
+    }
+    const uint64_t FIXED_MAX = 480ULL * 1024 * 1024;
+    uint64_t use_max = min(dyn_max, FIXED_MAX) * 11 / 10;
+
+    // border
+    tft.drawRect(graph_left, graph_top, graph_width, graph_height, TFT_WHITE);
+
+    // Y-axis labels
+    tft.setTextColor(TFT_CYAN);
+    tft.loadFont(SMALL_FONT, LittleFS);
+    double topM = use_max / 1024.0 / 1024.0;
+    double marks[5] = { topM, topM*0.75, topM*0.5, topM*0.25, 0.0 };
+    char ybuf[12];
+    for (int i = 0; i < 5; i++) {
+      int y = graph_top + i*(graph_height/4) - 7;
+      snprintf(ybuf, sizeof(ybuf), "%5.1f", marks[i]);
+      tft.drawString(ybuf, graph_left - 45, y, 0);
+    }
+    tft.drawString("Mbps", graph_left - 55, graph_top - 25, 0);
+    tft.unloadFont();
+
+    // bars
+    int p    = iface->pos;
+    int barW = graph_width / HISTORY_SIZE;
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+      if (p >= HISTORY_SIZE) p = 0;
+      uint64_t bits_rx = iface->hist_rx[p] * 8;
+      uint64_t bits_tx = iface->hist_tx[p] * 8;
+
+      int rx_h = (bits_rx >= use_max)
+                 ? graph_height - 1
+                 : (int)((bits_rx * (uint64_t)(graph_height - 1)) / use_max);
+      int tx_h = (bits_tx >= use_max)
+                 ? graph_height - 1
+                 : (int)((bits_tx * (uint64_t)(graph_height - 1)) / use_max);
+
+      rx_h = constrain(rx_h, 0, graph_height - 1);
+      tx_h = constrain(tx_h, 0, graph_height - 1);
+
+      int x = graph_left + i * barW;
+
+      if (tx_h)
+        tft.fillRect(x, graph_top + graph_height - tx_h, barW/2, tx_h, TFT_SKYBLUE);
+      if (rx_h)
+        tft.fillRect(x + barW/2, graph_top + graph_height - rx_h, barW/2, rx_h, TFT_GREENYELLOW);
+
+      p++;
+    }
+
+    // grid lines
+    for (int i = 1; i < 4; i++) {
+      int y = graph_top + i*(graph_height/4);
+      tft.drawFastHLine(graph_left+1, y, graph_width-2, TFT_DARKGREY);
+    }
+
+    // X-axis labels (draw only once, static)
+    static bool xAxisDrawn = false;
+    if (!xAxisDrawn) {
+      tft.setTextColor(TFT_CYAN);
+      tft.loadFont(SMALL_FONT, LittleFS);
+      char xbuf[8];
+      for (int i = 0; i <= HISTORY_SIZE; i += 10) {
+        int x = graph_left + i*graph_width/HISTORY_SIZE;
+        snprintf(xbuf, sizeof(xbuf), "%ds", HISTORY_SIZE - i);
+        tft.drawCentreString(xbuf, x, graph_top + graph_height + 5, 0);
+      }
+      tft.unloadFont();
+      xAxisDrawn = true;
+    }
+
+    // Legend - Top right above graph (draw only once, static)
+    static bool legendDrawn = false;
+    if (!legendDrawn) {
+      tft.loadFont(SMALL_FONT, LittleFS);
+      int legend_y = graph_top - 22;
+      tft.fillRect(SCREEN_WIDTH - 120, legend_y, 15, 10, TFT_SKYBLUE);
+      tft.drawString("TX", SCREEN_WIDTH - 100, legend_y, 0);
+      tft.fillRect(SCREEN_WIDTH - 60, legend_y, 15, 10, TFT_GREENYELLOW);
+      tft.drawString("RX", SCREEN_WIDTH - 40, legend_y, 0);
+      tft.unloadFont();
+      legendDrawn = true;
+    }
+  }
+
+  delay(1000);
+}
