@@ -369,6 +369,4 @@ Potential future enhancements:
 
 ---
 
-**Made with ❤️ for network enthusiasts and Mikrotik users**
-
 *Last Updated: November 2024 | Version 2.3*
